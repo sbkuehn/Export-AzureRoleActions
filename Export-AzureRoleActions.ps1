@@ -1,97 +1,104 @@
 <#
 .SYNOPSIS
-    Generates full expanded Allowed and NotAllowed Azure RBAC actions for a given built in or custom Azure role.
-
-.DESCRIPTION
-    Azure RBAC roles that use wildcard based Actions or NotActions can be difficult to understand. 
-    This script resolves all permitted and denied operations by expanding all Azure provider operations 
-    and applying the role definition filters. It exports the results into CSV files for reporting or audit purposes.
-
-.PARAMETER RoleName
-    The Azure RBAC role name to analyze. For example "Contributor" or "Reader" or a custom role.
-
-.PARAMETER OutputPath
-    Path where CSV files should be saved. The script will create the folder if it does not exist.
-
-.EXAMPLE
-    .\Export-AzureRoleActions.ps1 -RoleName Contributor -OutputPath "C:\Reports\RBAC"
-
-.EXAMPLE
-    .\Export-AzureRoleActions.ps1 -RoleName "Custom Billing Role" -OutputPath ".\Exports"
+    Logs into Azure, asks for a role name and an output folder,
+    then exports Allowed and NotAllowed operations to CSV files.
 
 .NOTES
-    Author: Shannon Eldridge Kuehn (your name as requested)
-    Version: 1.0
-    Azure PowerShell modules required:
-        Az.Accounts
-        Az.Resources
-
-    You must be logged into Azure with Connect-AzAccount prior to running this script.
+    Author: Shannon Eldridge Kuehn
+    Version: 3.2
 #>
 
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$RoleName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$OutputPath
-)
-
 function Write-Log {
-    param(
-        [string]$Message,
-        [string]$Level = "INFO"
-    )
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "[$timestamp][$Level] $Message"
+    param([string]$Message)
+    Write-Host "$(Get-Date -Format 'HH:mm:ss')  $Message"
+}
+
+# -----------------------------------------------------------
+# Module installer
+# -----------------------------------------------------------
+function Ensure-Module {
+    param([string]$ModuleName)
+
+    if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+        Write-Log "Installing required module '$ModuleName'..."
+        try {
+            Install-Module -Name $ModuleName -Scope CurrentUser -Force -ErrorAction Stop
+        }
+        catch {
+            throw "Could not install module $ModuleName. Install it manually and try again."
+        }
+    }
+    else {
+        Write-Log "Module '$ModuleName' already installed."
+    }
 }
 
 try {
-    Write-Log "Validating Azure connection..."
+    Write-Log "Checking required modules..."
+    Ensure-Module -ModuleName Az
 
-    if (-not (Get-AzContext)) {
-        throw "No Azure context found. Please run Connect-AzAccount before executing this script."
+    Write-Log "Logging into Azure..."
+    Connect-AzAccount -ErrorAction Stop | Out-Null
+    Write-Log "Login successful."
+
+    # Prompt for the Azure RBAC role name
+    $RoleName = Read-Host "Enter the Azure role you want to evaluate (example: Contributor)"
+    if (-not $RoleName) { throw "No role name entered. Script cannot continue." }
+
+    # Prompt for export folder path
+    $OutputFolder = Read-Host "Enter the folder path where CSV files should be saved"
+    if (-not $OutputFolder) { throw "No folder path entered. Script cannot continue." }
+
+    if (-not (Test-Path $OutputFolder)) {
+        Write-Log "Folder does not exist. Creating it now..."
+        New-Item -Path $OutputFolder -ItemType Directory | Out-Null
     }
 
-    Write-Log "Fetching role definition for '$RoleName'..."
+    Write-Log "Retrieving role definition for '$RoleName'..."
     $role = Get-AzRoleDefinition -Name $RoleName
+    if (-not $role) { throw "Role '$RoleName' not found. Check spelling and try again." }
 
-    Write-Log "Fetching all Azure provider operations. This may take some time..."
+    Write-Log "Retrieving provider operations. This may take a moment..."
     $allOps = Get-AzProviderOperation | Select-Object -ExpandProperty Operation
 
-    Write-Log "Expanding NotActions for role '$RoleName'..."
+    # Progress bar setup
+    $total = $role.NotActions.Count
+    $count = 0
+    $expandedNotAllowed = @()
 
-    $expandedNotAllowed = foreach ($na in $role.NotActions) {
+    Write-Log "Expanding NotAllowed actions..."
+    foreach ($na in $role.NotActions) {
+        $count++
+        Write-Progress -Activity "Expanding NotAllowed operations" -Status "$count of $total" -PercentComplete (($count / $total) * 100)
+
         $pattern = "^" + ($na -replace '\*', '.*') + "$"
-        $allOps | Where-Object { $_ -match $pattern }
+        $expandedNotAllowed += $allOps | Where-Object { $_ -match $pattern }
     }
 
-    Write-Log "Calculating Allowed and NotAllowed operations..."
+    Write-Log "Calculating Allowed operations..."
     $allowedActions = $allOps | Where-Object { $expandedNotAllowed -notcontains $_ }
 
-    Write-Log "Preparing output folder at '$OutputPath'..."
-    if (-not (Test-Path -Path $OutputPath)) {
-        New-Item -Path $OutputPath -ItemType Directory | Out-Null
-    }
+    Write-Log "Building CSV data..."
 
     $allowedCsv = $allowedActions | ForEach-Object {
         [PSCustomObject]@{
-            RoleName   = $RoleName
-            Operation  = $_
-            Allowed    = $true
+            RoleName  = $RoleName
+            Operation = $_
+            Allowed   = $true
         }
     }
 
     $notAllowedCsv = $expandedNotAllowed | ForEach-Object {
         [PSCustomObject]@{
-            RoleName   = $RoleName
-            Operation  = $_
-            Allowed    = $false
+            RoleName  = $RoleName
+            Operation = $_
+            Allowed   = $false
         }
     }
 
-    $allowedPath = Join-Path $OutputPath "AllowedActions.csv"
-    $notAllowedPath = Join-Path $OutputPath "NotAllowedActions.csv"
+    # Output file paths
+    $allowedPath = Join-Path $OutputFolder "AllowedActions.csv"
+    $notAllowedPath = Join-Path $OutputFolder "NotAllowedActions.csv"
 
     Write-Log "Exporting Allowed actions to '$allowedPath'..."
     $allowedCsv | Export-Csv -Path $allowedPath -NoTypeInformation -Encoding UTF8
@@ -99,9 +106,12 @@ try {
     Write-Log "Exporting NotAllowed actions to '$notAllowedPath'..."
     $notAllowedCsv | Export-Csv -Path $notAllowedPath -NoTypeInformation -Encoding UTF8
 
-    Write-Log "Export complete. Role analysis finished successfully." "SUCCESS"
+    Write-Log "Export complete. Files saved to:"
+    Write-Host $OutputFolder
+    Write-Log "Process finished successfully."
+
 }
 catch {
-    Write-Log $_.Exception.Message "ERROR"
+    Write-Host "ERROR: $($_.Exception.Message)"
     exit 1
 }
